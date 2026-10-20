@@ -27,11 +27,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuración de zona horaria de Colombia
+# Configuración de zona horaria de Colombia (America/Bogota, UTC-5)
 TZ_COLOMBIA = ZoneInfo("America/Bogota")
 
 def obtener_hora_colombia():
-    """Devuelve la fecha y hora actual en zona horaria de Colombia (UTC-5)"""
+    """Devuelve la fecha y hora actual en zona horaria de Colombia."""
     return datetime.now(TZ_COLOMBIA)
 
 # Configuración de Gemini LLM
@@ -39,8 +39,8 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
-# Clave de escritura del nuevo canal de ThingSpeak
-THINGSPEAK_WRITE_KEY = os.getenv("THINGSPEAK_WRITE_KEY", "6L9PJOXG9FZMFYU")
+# Clave verificada de escritura de ThingSpeak (Canal 3543191)
+THINGSPEAK_WRITE_KEY = os.getenv("THINGSPEAK_WRITE_KEY", "H20B180D9AB4YGYH")
 THINGSPEAK_UPDATE_URL = "https://api.thingspeak.com/update"
 
 configuracion_sistema = {
@@ -76,11 +76,10 @@ def raiz():
         "docs": "/docs"
     }
 
-# 1. Ingesta: Guarda en Neon PostgreSQL con hora Colombia y sincroniza hacia ThingSpeak
+# 1. Ingesta: Guarda en Neon PostgreSQL y sincroniza hacia ThingSpeak
 @app.post("/api/esp32/enviar-datos")
 def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
     try:
-        # Fecha y hora exacta de Colombia
         ahora_colombia = obtener_hora_colombia()
 
         # A. Almacenamiento directo en Neon PostgreSQL
@@ -106,11 +105,12 @@ def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
             db.add(alerta)
             db.commit()
 
-        # C. Mapeo numérico del estado para ThingSpeak (Field 3)
+        # C. Mapeo numérico del estado para Field 3 en ThingSpeak
+        # 1: Normal, 2: Regular/Alerta, 3: Crítica
         estado_map = {"normal": 1, "regular": 2, "alerta": 2, "critica": 3}
         estado_codificado = estado_map.get(str(datos.estado).lower(), 1)
 
-        # D. Publicar hacia ThingSpeak mediante POST
+        # D. Publicar hacia ThingSpeak mediante POST con los datos extraídos de la BD
         ts_entry_id = "No sincronizado"
         if THINGSPEAK_WRITE_KEY:
             try:
@@ -143,7 +143,7 @@ def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error al procesar telemetría: {str(e)}")
 
-# 2. Historial de lecturas con timestamp ajustado
+# 2. Historial de lecturas almacenadas en Neon con timestamp formateado
 @app.get("/api/calidad-agua")
 def obtener_calidad_agua(limite: int = Query(20, ge=1, le=100), db: Session = Depends(get_db)):
     lecturas = db.query(LecturaAgua).order_by(desc(LecturaAgua.timestamp)).limit(limite).all()
@@ -152,7 +152,6 @@ def obtener_calidad_agua(limite: int = Query(20, ge=1, le=100), db: Session = De
     for item in reversed(lecturas):
         ts_str = None
         if item.timestamp:
-            # Si el registro no tiene tzinfo asignado en la BD, lo contextualizamos a Colombia
             dt = item.timestamp if item.timestamp.tzinfo else item.timestamp.replace(tzinfo=TZ_COLOMBIA)
             ts_str = dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -213,7 +212,7 @@ def obtener_incidentes(db: Session = Depends(get_db)):
         for inc in incidentes
     ]
 
-# 5. Configuración de frecuencia
+# 5. Configuración de frecuencia de muestreo
 @app.get("/api/control/frecuencia")
 def obtener_frecuencia():
     return configuracion_sistema
@@ -226,7 +225,7 @@ def configurar_frecuencia(datos: FrecuenciaInput):
         "intervalo_segundos": configuracion_sistema["intervalo_segundos"]
     }
 
-# 6. Teclado matricial del ESP32
+# 6. Procesamiento de teclas del ESP32
 @app.post("/api/control/teclado")
 def procesar_tecla_esp32(datos: TeclaInput, db: Session = Depends(get_db)):
     tecla = datos.tecla.strip()
@@ -264,7 +263,7 @@ def procesar_tecla_esp32(datos: TeclaInput, db: Session = Depends(get_db)):
             "mensaje_lcd": f"Tecla {tecla} sin accion"
         }
 
-# 7. Diagnóstico técnico con LLM
+# 7. Diagnóstico técnico con Gemini LLM
 @app.post("/api/llm/consultar")
 def consultar_llm(datos: ConsultaLLMInput, db: Session = Depends(get_db)):
     ultima = db.query(LecturaAgua).order_by(desc(LecturaAgua.timestamp)).first()
