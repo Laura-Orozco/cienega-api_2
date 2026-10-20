@@ -27,19 +27,16 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-# --- MODELOS ORM (TABLAS DE NEON) ---
-
 class LecturaAgua(Base):
-    __tablename__ = "lecturas_agua"
+    # Nombre exacto de tu tabla en Neon PostgreSQL
+    __tablename__ = "lecturas_calidad_agua"
 
     id = Column(Integer, primary_key=True, index=True)
-    identificador = Column(String(50), nullable=True, default="ESP32_Breiner")
+    identificador = Column(String(50), nullable=True, default="ESP32_Laura")
     temperatura = Column(Float, nullable=False)
     turbidez = Column(Float, nullable=False)
     estado = Column(String(50), nullable=True, default="Normal")
-    # DateTime(timezone=True) genera TIMESTAMPTZ en PostgreSQL para guardar la zona horaria de Colombia
     timestamp = Column(DateTime(timezone=True), index=True)
-
 
 class Incidente(Base):
     __tablename__ = "incidentes"
