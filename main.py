@@ -17,7 +17,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Habilitar CORS para permitir peticiones desde cualquier frontend
+# Habilitar CORS para permitir peticiones desde cualquier navegador/dashboard
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,8 +31,8 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
-# Canal y Write API Key de ThingSpeak
-THINGSPEAK_WRITE_KEY = os.getenv("THINGSPEAK_WRITE_KEY", "TU_WRITE_API_KEY_AQUI")
+# Clave de escritura real de ThingSpeak
+THINGSPEAK_WRITE_KEY = os.getenv("THINGSPEAK_WRITE_KEY", "IWE7C67EMHPZP8C")
 
 # Estado en memoria para control de frecuencia
 configuracion_sistema = {
@@ -93,17 +93,16 @@ def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
             db.add(alerta)
             db.commit()
 
-        # C. Reenviar a ThingSpeak (si la key está configurada)
-        if THINGSPEAK_WRITE_KEY and THINGSPEAK_WRITE_KEY != "TU_WRITE_API_KEY_AQUI":
-            try:
-                url_ts = f"https://api.thingspeak.com/update?api_key={THINGSPEAK_WRITE_KEY}&field1={datos.temperatura}&field2={datos.turbidez}"
-                requests.get(url_ts, timeout=2)
-            except Exception as e:
-                print(f"Aviso ThingSpeak: {e}")
+        # C. Reenviar automáticamente a ThingSpeak para mover el reloj y las gráficas
+        try:
+            url_ts = f"https://api.thingspeak.com/update?api_key={THINGSPEAK_WRITE_KEY}&field1={datos.temperatura}&field2={datos.turbidez}"
+            requests.get(url_ts, timeout=3)
+        except Exception as e:
+            print(f"Aviso ThingSpeak: {e}")
 
         return {
             "status": "success",
-            "mensaje": "Dato persistido en Neon PostgreSQL",
+            "mensaje": "Dato persistido en Neon PostgreSQL y sincronizado con ThingSpeak",
             "id": nueva_lectura.id,
             "frecuencia_actual": configuracion_sistema["intervalo_segundos"]
         }
