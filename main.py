@@ -173,13 +173,15 @@ def obtener_calidad_agua(limite: int = Query(20, ge=1, le=100), db: Session = De
 # 3. Consulta de la última telemetría persistida
 @app.get("/api/telemetria")
 def obtener_ultima_telemetria(db: Session = Depends(get_db)):
+    # Consulta el último registro insertado en 'lecturas_calidad_agua'
     ultima = db.query(LecturaAgua).order_by(desc(LecturaAgua.timestamp)).first()
+    
     if not ultima:
         return {
             "identificador": "ESP32_Breiner",
             "temperatura": 0.0,
             "turbidez": 0.0,
-            "estado": "Sin datos",
+            "estado": "Normal",
             "timestamp": obtener_hora_colombia().strftime("%Y-%m-%d %H:%M:%S")
         }
 
@@ -193,10 +195,9 @@ def obtener_ultima_telemetria(db: Session = Depends(get_db)):
         "identificador": ultima.identificador,
         "temperatura": ultima.temperatura,
         "turbidez": ultima.turbidez,
-        "estado": ultima.estado,
+        "estado": ultima.estado,  # Campo 'estado' extraído directamente de lecturas_calidad_agua
         "timestamp": ts_str
     }
-
 # 4. Listado de incidentes
 @app.get("/api/incidentes")
 def obtener_incidentes(db: Session = Depends(get_db)):
