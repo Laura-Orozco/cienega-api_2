@@ -1,23 +1,23 @@
 import os
+from datetime import datetime
+from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
-from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 import requests
 import google.generativeai as genai
 
-# Importar modelos y sesión de la base de datos
+# Modelos ORM y conexión de base de datos
 from database import get_db, LecturaAgua, Incidente
 
 app = FastAPI(
-    title="API Central IoT - Monitoreo Calidad del Agua (Neon DB)",
+    title="API Central IoT - Monitoreo Calidad del Agua (Neon DB & ThingSpeak)",
     version="1.0.0"
 )
 
-# Configuración de CORS para permitir peticiones desde el frontend
+# Configuración de CORS para peticiones desde el dashboard web
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,20 +26,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuración opcional para Gemini LLM
+# Configuración de Gemini LLM
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
-# Configuración de ThingSpeak (Canal 3540837)
+# Clave de escritura de ThingSpeak (Canal 3540837)
 THINGSPEAK_WRITE_KEY = os.getenv("THINGSPEAK_WRITE_KEY", "IWE7C67EMHPZP8C")
+THINGSPEAK_UPDATE_URL = "https://api.thingspeak.com/update"
 
-# Parámetros del sistema
+# Configuración interna del sistema
 configuracion_sistema = {
     "intervalo_segundos": 15
 }
 
-# --- MODELOS PYDANTIC ---
+# --- ESQUEMAS PYDANTIC ---
+
 class TelemetriaInput(BaseModel):
     identificador: Optional[str] = "ESP32_Breiner"
     temperatura: float
@@ -56,7 +58,7 @@ class ConsultaLLMInput(BaseModel):
     pregunta: Optional[str] = None
 
 
-# --- ENDPOINTS ---
+# --- RUTAS DE LA API ---
 
 @app.get("/")
 def raiz():
@@ -66,11 +68,11 @@ def raiz():
         "docs": "/docs"
     }
 
-# 1. Recepción de telemetría (ESP32 -> FastAPI -> Neon DB -> ThingSpeak)
+# 1. Ingesta: Guarda en Neon PostgreSQL y sincroniza desde la BD hacia ThingSpeak
 @app.post("/api/esp32/enviar-datos")
 def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
     try:
-        # A. Guardar en Neon PostgreSQL
+        # A. Almacenamiento directo en Neon PostgreSQL
         nueva_lectura = LecturaAgua(
             identificador=datos.identificador,
             temperatura=datos.temperatura,
@@ -82,41 +84,48 @@ def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(nueva_lectura)
 
-        # B. Registrar incidente si los niveles no son normales
+        # B. Detección y registro de incidentes en BD
         if datos.estado and datos.estado.lower() in ["critica", "regular", "alerta"]:
             alerta = Incidente(
                 nivel="ALERTA",
-                descripcion=f"Anomalía en {datos.identificador}: Temp={datos.temperatura}°C, Turb={datos.turbidez}NTU",
+                descripcion=f"Anomalía detectada en {datos.identificador}: Temp={datos.temperatura}°C, Turb={datos.turbidez}NTU",
                 estado="ACTIVO",
                 timestamp=datetime.utcnow()
             )
             db.add(alerta)
             db.commit()
 
-        # C. Reenviar datos a ThingSpeak para mover el reloj y las gráficas
-        thingspeak_status = "No ejecutado"
+        # C. Reenvío a ThingSpeak con el dato extraído de Neon PostgreSQL (usando POST)
+        ts_entry_id = "No sincronizado"
         if THINGSPEAK_WRITE_KEY:
             try:
-                url_ts = f"https://api.thingspeak.com/update?api_key={THINGSPEAK_WRITE_KEY}&field1={datos.temperatura}&field2={datos.turbidez}"
-                res_ts = requests.get(url_ts, timeout=3)
-                thingspeak_status = f"Entrada registrada ID: {res_ts.text}"
-                print(f"[ThingSpeak] {thingspeak_status}")
+                payload = {
+                    "api_key": THINGSPEAK_WRITE_KEY,
+                    "field1": str(nueva_lectura.temperatura),
+                    "field2": str(nueva_lectura.turbidez)
+                }
+                res_ts = requests.post(THINGSPEAK_UPDATE_URL, data=payload, timeout=4)
+                ts_entry_id = res_ts.text.strip()
+                print(f"[ThingSpeak POST Response]: {ts_entry_id}")
             except Exception as e:
-                thingspeak_status = f"Error: {e}"
-                print(f"[ThingSpeak Error] {e}")
+                ts_entry_id = f"Error de conexión: {str(e)}"
+                print(f"[ThingSpeak Error]: {e}")
 
         return {
             "status": "success",
-            "mensaje": "Dato persistido en Neon PostgreSQL y sincronizado con ThingSpeak",
+            "origen_datos": "Neon PostgreSQL -> ThingSpeak",
             "id_neon": nueva_lectura.id,
-            "thingspeak": thingspeak_status,
+            "temperatura_db": nueva_lectura.temperatura,
+            "turbidez_db": nueva_lectura.turbidez,
+            "thingspeak_entry_id": ts_entry_id,
             "frecuencia_actual": configuracion_sistema["intervalo_segundos"]
         }
+
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error al procesar la telemetría: {str(e)}")
 
-# 2. Historial de lecturas
+# 2. Historial de lecturas almacenadas en Neon
 @app.get("/api/calidad-agua")
 def obtener_calidad_agua(limite: int = Query(20, ge=1, le=100), db: Session = Depends(get_db)):
     lecturas = db.query(LecturaAgua).order_by(desc(LecturaAgua.timestamp)).limit(limite).all()
@@ -137,7 +146,7 @@ def obtener_calidad_agua(limite: int = Query(20, ge=1, le=100), db: Session = De
         "data": data
     }
 
-# 3. Última lectura registrada en Neon
+# 3. Consulta de la última telemetría persistida en base de datos
 @app.get("/api/telemetria")
 def obtener_ultima_telemetria(db: Session = Depends(get_db)):
     ultima = db.query(LecturaAgua).order_by(desc(LecturaAgua.timestamp)).first()
@@ -158,7 +167,7 @@ def obtener_ultima_telemetria(db: Session = Depends(get_db)):
         "timestamp": ultima.timestamp.isoformat() if ultima.timestamp else None
     }
 
-# 4. Listado de incidentes
+# 4. Listado de incidentes registrados en Neon
 @app.get("/api/incidentes")
 def obtener_incidentes(db: Session = Depends(get_db)):
     incidentes = db.query(Incidente).order_by(desc(Incidente.timestamp)).limit(10).all()
@@ -173,7 +182,7 @@ def obtener_incidentes(db: Session = Depends(get_db)):
         for inc in incidentes
     ]
 
-# 5. Control de frecuencia
+# 5. Obtención y modificación de la frecuencia de muestreo
 @app.get("/api/control/frecuencia")
 def obtener_frecuencia():
     return configuracion_sistema
@@ -186,7 +195,7 @@ def configurar_frecuencia(datos: FrecuenciaInput):
         "intervalo_segundos": configuracion_sistema["intervalo_segundos"]
     }
 
-# 6. Teclado matricial del ESP32
+# 6. Procesamiento de eventos del teclado matricial
 @app.post("/api/control/teclado")
 def procesar_tecla_esp32(datos: TeclaInput, db: Session = Depends(get_db)):
     tecla = datos.tecla.strip()
@@ -215,7 +224,7 @@ def procesar_tecla_esp32(datos: TeclaInput, db: Session = Depends(get_db)):
             "tecla": "3",
             "accion": "DIAGNOSTICO_LLM",
             "mensaje_lcd": "Analisis listo",
-            "diagnostico_completo": f"Telemetría actual: Temp={temp}°C, Turbidez={turb}NTU."
+            "diagnostico_completo": f"Telemetría actual en Neon: Temp={temp}°C, Turbidez={turb}NTU."
         }
     else:
         return {
@@ -224,7 +233,7 @@ def procesar_tecla_esp32(datos: TeclaInput, db: Session = Depends(get_db)):
             "mensaje_lcd": f"Tecla {tecla} sin accion"
         }
 
-# 7. Diagnóstico LLM
+# 7. Diagnóstico técnico mediante Gemini LLM
 @app.post("/api/llm/consultar")
 def consultar_llm(datos: ConsultaLLMInput, db: Session = Depends(get_db)):
     ultima = db.query(LecturaAgua).order_by(desc(LecturaAgua.timestamp)).first()
@@ -236,7 +245,7 @@ def consultar_llm(datos: ConsultaLLMInput, db: Session = Depends(get_db)):
 
     prompt = f"""
     Eres un asistente experto en calidad de agua e ingeniería sanitaria.
-    Parámetros actuales registrados:
+    Parámetros actuales registrados en la base de datos:
     - Temperatura: {temp} °C
     - Turbidez: {turb} NTU
     - Estado clasificado: {estado}
