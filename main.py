@@ -225,3 +225,44 @@ def ejecutar_gemini(prompt: str) -> str:
         return response.text.strip()
     except Exception as e:
         return f"Error en inferencia LLM: {str(e)}"
+import requests
+
+# Reemplaza con tu Write API Key de ThingSpeak
+THINGSPEAK_WRITE_KEY = "TU_WRITE_API_KEY_AQUI"
+
+@app.post("/api/esp32/enviar-datos")
+def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
+    # 1. Guardar en Neon PostgreSQL (Tu Punto 2)
+    nueva_lectura = LecturaAgua(
+        identificador=datos.identificador,
+        temperatura=datos.temperatura,
+        turbidez=datos.turbidez,
+        estado=datos.estado
+    )
+    db.add(nueva_lectura)
+    db.commit()
+    db.refresh(nueva_lectura)
+
+    # 2. Registrar incidente si el estado no es normal
+    if datos.estado and datos.estado.lower() in ["critica", "regular", "alerta"]:
+        alerta = Incidente(
+            nivel="ALERTA",
+            descripcion=f"Anomalía en {datos.identificador}: Temp={datos.temperatura}°C, Turb={datos.turbidez}NTU",
+            estado="ACTIVO"
+        )
+        db.add(alerta)
+        db.commit()
+
+    # 3. Reenviar automáticamente a ThingSpeak para mover el reloj y gráficas
+    try:
+        url_ts = f"https://api.thingspeak.com/update?api_key={THINGSPEAK_WRITE_KEY}&field1={datos.temperatura}&field2={datos.turbidez}"
+        requests.get(url_ts, timeout=3)
+    except Exception as e:
+        print(f"Error actualizando ThingSpeak: {e}")
+
+    return {
+        "status": "success",
+        "mensaje": "Dato persistido en Neon PostgreSQL y sincronizado con ThingSpeak",
+        "id": nueva_lectura.id,
+        "frecuencia_actual": 10
+    }
