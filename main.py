@@ -9,7 +9,7 @@ from sqlalchemy import desc
 import requests
 import google.generativeai as genai
 
-# Importar modelos y sesión desde database.py
+# Importar modelos y sesión de la base de datos
 from database import get_db, LecturaAgua, Incidente
 
 app = FastAPI(
@@ -17,7 +17,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Habilitar CORS para permitir peticiones desde cualquier navegador/dashboard
+# Configuración de CORS para permitir peticiones desde el frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,17 +26,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuración de Gemini LLM (opcional/resiliente si no hay API key)
+# Configuración opcional para Gemini LLM
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
-# Clave de escritura real de ThingSpeak
+# Configuración de ThingSpeak (Canal 3540837)
 THINGSPEAK_WRITE_KEY = os.getenv("THINGSPEAK_WRITE_KEY", "IWE7C67EMHPZP8C")
 
-# Estado en memoria para control de frecuencia
+# Parámetros del sistema
 configuracion_sistema = {
-    "intervalo_segundos": 10
+    "intervalo_segundos": 15
 }
 
 # --- MODELOS PYDANTIC ---
@@ -56,7 +56,7 @@ class ConsultaLLMInput(BaseModel):
     pregunta: Optional[str] = None
 
 
-# --- RUTAS DE LA API ---
+# --- ENDPOINTS ---
 
 @app.get("/")
 def raiz():
@@ -66,7 +66,7 @@ def raiz():
         "docs": "/docs"
     }
 
-# 1. Ingesta de datos desde el ESP32
+# 1. Recepción de telemetría (ESP32 -> FastAPI -> Neon DB -> ThingSpeak)
 @app.post("/api/esp32/enviar-datos")
 def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
     try:
@@ -82,7 +82,7 @@ def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(nueva_lectura)
 
-        # B. Registrar incidente si los valores son anómalos
+        # B. Registrar incidente si los niveles no son normales
         if datos.estado and datos.estado.lower() in ["critica", "regular", "alerta"]:
             alerta = Incidente(
                 nivel="ALERTA",
@@ -93,24 +93,30 @@ def recibir_datos_esp32(datos: TelemetriaInput, db: Session = Depends(get_db)):
             db.add(alerta)
             db.commit()
 
-        # C. Reenviar automáticamente a ThingSpeak para mover el reloj y las gráficas
-        try:
-            url_ts = f"https://api.thingspeak.com/update?api_key={THINGSPEAK_WRITE_KEY}&field1={datos.temperatura}&field2={datos.turbidez}"
-            requests.get(url_ts, timeout=3)
-        except Exception as e:
-            print(f"Aviso ThingSpeak: {e}")
+        # C. Reenviar datos a ThingSpeak para mover el reloj y las gráficas
+        thingspeak_status = "No ejecutado"
+        if THINGSPEAK_WRITE_KEY:
+            try:
+                url_ts = f"https://api.thingspeak.com/update?api_key={THINGSPEAK_WRITE_KEY}&field1={datos.temperatura}&field2={datos.turbidez}"
+                res_ts = requests.get(url_ts, timeout=3)
+                thingspeak_status = f"Entrada registrada ID: {res_ts.text}"
+                print(f"[ThingSpeak] {thingspeak_status}")
+            except Exception as e:
+                thingspeak_status = f"Error: {e}"
+                print(f"[ThingSpeak Error] {e}")
 
         return {
             "status": "success",
             "mensaje": "Dato persistido en Neon PostgreSQL y sincronizado con ThingSpeak",
-            "id": nueva_lectura.id,
+            "id_neon": nueva_lectura.id,
+            "thingspeak": thingspeak_status,
             "frecuencia_actual": configuracion_sistema["intervalo_segundos"]
         }
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error al guardar datos: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al procesar la telemetría: {str(e)}")
 
-# 2. Historial de lecturas para gráficos
+# 2. Historial de lecturas
 @app.get("/api/calidad-agua")
 def obtener_calidad_agua(limite: int = Query(20, ge=1, le=100), db: Session = Depends(get_db)):
     lecturas = db.query(LecturaAgua).order_by(desc(LecturaAgua.timestamp)).limit(limite).all()
@@ -131,7 +137,7 @@ def obtener_calidad_agua(limite: int = Query(20, ge=1, le=100), db: Session = De
         "data": data
     }
 
-# 3. Última telemetría registrada
+# 3. Última lectura registrada en Neon
 @app.get("/api/telemetria")
 def obtener_ultima_telemetria(db: Session = Depends(get_db)):
     ultima = db.query(LecturaAgua).order_by(desc(LecturaAgua.timestamp)).first()
@@ -167,7 +173,7 @@ def obtener_incidentes(db: Session = Depends(get_db)):
         for inc in incidentes
     ]
 
-# 5. Configuración de frecuencia de muestreo
+# 5. Control de frecuencia
 @app.get("/api/control/frecuencia")
 def obtener_frecuencia():
     return configuracion_sistema
